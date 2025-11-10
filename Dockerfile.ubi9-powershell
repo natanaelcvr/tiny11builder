@@ -1,0 +1,23 @@
+# Dockerfile for Red Hat UBI 9 with PowerShell
+# Based on: https://learn.microsoft.com/en-us/powershell/scripting/install/install-rhel?view=powershell-7.5
+
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+LABEL description="Red Hat UBI 9 with PowerShell 7.5.4 installed"
+LABEL maintainer="nramalho"
+
+# Update system and install basic dependencies
+RUN dnf update -y && \
+    dnf install -y \
+    less \
+    && dnf clean all
+
+# Install PowerShell 7.5.4 via direct download (recommended method for RHEL/UBI)
+RUN dnf install -y https://github.com/PowerShell/PowerShell/releases/download/v7.5.4/powershell-7.5.4-1.rh.x86_64.rpm
+
+# Verify PowerShell installation
+RUN pwsh --version
+
+# Set PowerShell as the default shell for the container
+CMD ["pwsh"]
+

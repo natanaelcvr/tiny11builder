@@ -1,579 +1,551 @@
-if ((Get-ExecutionPolicy) -eq 'Restricted') {
-    Write-Host "Your current PowerShell Execution Policy is set to Restricted, which prevents scripts from running. Do you want to change it to RemoteSigned? (yes/no)"
-    $response = Read-Host
-    if ($response -eq 'yes') {
-        Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Confirm:$false
-    } else {
-        Write-Host "The script cannot be run without changing the execution policy. Exiting..."
-        exit
-    }
-}
+<#
+.SYNOPSIS
+    Cria uma imagem "core" altamente reduzida do Windows 11 utilizando apenas ferramentas Microsoft.
 
-# Check and run the script as admin if required
-$adminSID = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
-$adminGroup = $adminSID.Translate([System.Security.Principal.NTAccount])
-$myWindowsID=[System.Security.Principal.WindowsIdentity]::GetCurrent()
-$myWindowsPrincipal=new-object System.Security.Principal.WindowsPrincipal($myWindowsID)
-$adminRole=[System.Security.Principal.WindowsBuiltInRole]::Administrator
-if (! $myWindowsPrincipal.IsInRole($adminRole))
-{
-    Write-Host "Restarting Tiny11 image creator as admin in a new window, you can close this one."
-    $newProcess = new-object System.Diagnostics.ProcessStartInfo "PowerShell";
-    $newProcess.Arguments = $myInvocation.MyCommand.Definition;
-    $newProcess.Verb = "runas";
-    [System.Diagnostics.Process]::Start($newProcess);
-    exit
-}
-Start-Transcript -Path "$PSScriptRoot\tiny11.log" 
-# Ask the user for input
-Write-Host "Welcome to tiny11 core builder! BETA 09-05-25"
-Write-Host "This script generates a significantly reduced Windows 11 image. However, it's not suitable for regular use due to its lack of serviceability - you can't add languages, updates, or features post-creation. tiny11 Core is not a full Windows 11 substitute but a rapid testing or development tool, potentially useful for VM environments."
-Write-Host "Do you want to continue? (y/n)"
-$input = Read-Host
+.DESCRIPTION
+    Automatiza a geração de uma imagem Windows 11 focada em ambientes de teste/VM, removendo uma grande
+    quantidade de componentes, pacotes e tarefas. Inclui ajustes de registro, desativação de Windows
+    Update/Defender e geração do ISO final. A execução padrão preserva a possibilidade de interação, mas
+    parâmetros adicionais permitem o uso em cenários não interativos.
 
-if ($input -eq 'y') {
-    Write-Host "Off we go..."
-Start-Sleep -Seconds 3
-Clear-Host
+.PARAMETER ISO
+    Letra (C-Z) da unidade onde o ISO original do Windows 11 está montado.
 
-$mainOSDrive = $env:SystemDrive
-$hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
-New-Item -ItemType Directory -Force -Path "$mainOSDrive\tiny11\sources" >null
-$DriveLetter = Read-Host "Please enter the drive letter for the Windows 11 image"
-$DriveLetter = $DriveLetter + ":"
+.PARAMETER Scratch
+    Letra (C-Z) da unidade onde os arquivos temporários serão armazenados. Quando omitido, utiliza o
+    drive do sistema operacional.
 
-if ((Test-Path "$DriveLetter\sources\boot.wim") -eq $false -or (Test-Path "$DriveLetter\sources\install.wim") -eq $false) {
-    if ((Test-Path "$DriveLetter\sources\install.esd") -eq $true) {
-        Write-Host "Found install.esd, converting to install.wim..."
-        &  'dism' '/English' "/Get-WimInfo" "/wimfile:$DriveLetter\sources\install.esd"
-        $index = Read-Host "Please enter the image index"
-        Write-Host ' '
-        Write-Host 'Converting install.esd to install.wim. This may take a while...'
-        & 'DISM' /Export-Image /SourceImageFile:"$DriveLetter\sources\install.esd" /SourceIndex:$index /DestinationImageFile:"$mainOSDrive\tiny11\sources\install.wim" /Compress:max /CheckIntegrity
-    } else {
-        Write-Host "Can't find Windows OS Installation files in the specified Drive Letter.."
-        Write-Host "Please enter the correct DVD Drive Letter.."
-        exit
-    }
-}
+.PARAMETER ImageIndex
+    Índice da imagem dentro do install.wim/esd que será processada.
 
-Write-Host "Copying Windows image..."
-Copy-Item -Path "$DriveLetter\*" -Destination "$mainOSDrive\tiny11" -Recurse -Force > null
-Set-ItemProperty -Path "$mainOSDrive\tiny11\sources\install.esd" -Name IsReadOnly -Value $false > $null 2>&1
-Remove-Item "$mainOSDrive\tiny11\sources\install.esd" > $null 2>&1
-Write-Host "Copy complete!"
-Start-Sleep -Seconds 2
-Clear-Host
-Write-Host "Getting image information:"
-&  'dism' '/English' "/Get-WimInfo" "/wimfile:$mainOSDrive\tiny11\sources\install.wim"
-$index = Read-Host "Please enter the image index"
-Write-Host "Mounting Windows image. This may take a while."
-$wimFilePath = "$($env:SystemDrive)\tiny11\sources\install.wim" 
-& takeown "/F" $wimFilePath 
-& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
+.PARAMETER AcceptEula
+    Aceita automaticamente a alteração da ExecutionPolicy para RemoteSigned quando necessário.
+
+.PARAMETER AutoElevate
+    Relança o script com privilégios administrativos caso necessário.
+
+.PARAMETER NoPrompt
+    Evita qualquer interação; parâmetros obrigatórios devem ser informados. Combine com -Force quando
+    desejar dispensar o aviso de uso experimental.
+
+.PARAMETER SkipCleanup
+    Mantém os diretórios temporários após a execução, útil para depuração.
+
+.PARAMETER SkipEject
+    Não desmonta o ISO de origem ao final.
+
+.PARAMETER EnableNetFx3
+    Habilita o recurso .NET Framework 3.5 durante o preparo da imagem.
+
+.PARAMETER PreserveResources
+    Mantém os arquivos baixados (oscdimg.exe/autounattend.xml) ao término da execução.
+
+.PARAMETER TranscriptDirectory
+    Diretório onde o log da execução (transcript) será gravado.
+
+.PARAMETER ConfigurationPath
+    Caminho opcional para um arquivo PSD1 com configurações alternativas.
+
+.PARAMETER ForceOscdimgDownload
+    Obriga o download de oscdimg.exe mesmo que o ADK esteja instalado.
+
+.PARAMETER Force
+    Suprime o aviso de uso experimental da variante core.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+param (
+    [ValidatePattern('^[d-zD-Z]$')]
+    [string]$ISO,
+
+    [ValidatePattern('^[d-zD-Z]$')]
+    [string]$Scratch,
+
+    [int]$ImageIndex,
+
+    [switch]$AcceptEula,
+    [switch]$AutoElevate,
+    [switch]$NoPrompt,
+    [switch]$SkipCleanup,
+    [switch]$SkipEject,
+    [switch]$EnableNetFx3,
+    [switch]$PreserveResources,
+
+    [ValidateNotNullOrEmpty()]
+    [string]$TranscriptDirectory = $PSScriptRoot,
+
+    [string]$ConfigurationPath,
+    [switch]$ForceOscdimgDownload,
+    [switch]$Force
+)
+
+$ErrorActionPreference = 'Stop'
+$modulePath = Join-Path -Path $PSScriptRoot -ChildPath 'Tiny11Builder.psm1'
+Import-Module -Name $modulePath -Force
+
+$transcriptStarted = $false
+
 try {
-    Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false -ErrorAction Stop
-} catch {
-    # This block will catch the error and suppress it.
-}
-New-Item -ItemType Directory -Force -Path "$mainOSDrive\scratchdir" > $null
-& dism /English "/mount-image" "/imagefile:$($env:SystemDrive)\tiny11\sources\install.wim" "/index:$index" "/mountdir:$($env:SystemDrive)\scratchdir"
+    Ensure-ExecutionPolicy -AcceptChange:$AcceptEula
 
-$imageIntl = & dism /English /Get-Intl "/Image:$($env:SystemDrive)\scratchdir"
-$languageLine = $imageIntl -split '\n' | Where-Object { $_ -match 'Default system UI language : ([a-zA-Z]{2}-[a-zA-Z]{2})' }
-
-if ($languageLine) {
-    $languageCode = $Matches[1]
-    Write-Host "Default system UI language code: $languageCode"
-} else {
-    Write-Host "Default system UI language code not found."
-}
-
-$imageInfo = & 'dism' '/English' '/Get-WimInfo' "/wimFile:$($env:SystemDrive)\tiny11\sources\install.wim" "/index:$index"
-$lines = $imageInfo -split '\r?\n'
-
-foreach ($line in $lines) {
-    if ($line -like '*Architecture : *') {
-        $architecture = $line -replace 'Architecture : ',''
-        # If the architecture is x64, replace it with amd64
-        if ($architecture -eq 'x64') {
-            $architecture = 'amd64'
+    if (-not (Test-Administrator)) {
+        if ($AutoElevate) {
+            Start-ElevatedSelf -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -UnboundArguments $MyInvocation.UnboundArguments
+            return
         }
-        Write-Host "Architecture: $architecture"
-        break
+
+        throw 'Este script deve ser executado com privilégios administrativos. Utilize -AutoElevate para relançar automaticamente.'
     }
-}
 
-if (-not $architecture) {
-    Write-Host "Architecture information not found."
-}
+    if (-not $Force) {
+        $warning = 'tiny11 core remove componentes críticos e gera uma imagem não suportada para uso cotidiano. Deseja continuar?'
+        if ($NoPrompt) {
+            throw 'Utilize -Force para assumir o risco inerente à criação do tiny11 core sem confirmação.'
+        }
 
-Write-Host "Mounting complete! Performing removal of applications..."
-
-$packages = & 'dism' '/English' "/image:$($env:SystemDrive)\scratchdir" '/Get-ProvisionedAppxPackages' |
-    ForEach-Object {
-        if ($_ -match 'PackageName : (.*)') {
-            $matches[1]
+        if (-not $PSCmdlet.ShouldContinue($warning, 'Confirmar execução do tiny11 core')) {
+            Write-Verbose 'Execução cancelada pelo usuário.'
+            return
         }
     }
-$packagePrefixes = 'Clipchamp.Clipchamp_', 'Microsoft.BingNews_', 'Microsoft.BingWeather_', 'Microsoft.GamingApp_', 'Microsoft.GetHelp_', 'Microsoft.Getstarted_', 'Microsoft.MicrosoftOfficeHub_', 'Microsoft.MicrosoftSolitaireCollection_', 'Microsoft.People_', 'Microsoft.PowerAutomateDesktop_', 'Microsoft.Todos_', 'Microsoft.WindowsAlarms_', 'microsoft.windowscommunicationsapps_', 'Microsoft.WindowsFeedbackHub_', 'Microsoft.WindowsMaps_', 'Microsoft.WindowsSoundRecorder_', 'Microsoft.Xbox.TCUI_', 'Microsoft.XboxGamingOverlay_', 'Microsoft.XboxGameOverlay_', 'Microsoft.XboxSpeechToTextOverlay_', 'Microsoft.YourPhone_', 'Microsoft.ZuneMusic_', 'Microsoft.ZuneVideo_', 'MicrosoftCorporationII.MicrosoftFamily_', 'MicrosoftCorporationII.QuickAssist_', 'MicrosoftTeams_', 'Microsoft.549981C3F5F10_', 'Microsoft.Windows.Copilot', 'MSTeams_', 'Microsoft.OutlookForWindows_', 'Microsoft.Windows.Teams_', 'Microsoft.Copilot_'
 
-$packagesToRemove = $packages | Where-Object {
-    $packageName = $_
-    $packagePrefixes -contains ($packagePrefixes | Where-Object { $packageName -like "$_*" })
-}
-foreach ($package in $packagesToRemove) {
-    write-host "Removing $package :"
-    & 'dism' '/English' "/image:$($env:SystemDrive)\scratchdir" '/Remove-ProvisionedAppxPackage' "/PackageName:$package"
-}
-
-Write-Host "Removing of system apps complete! Now proceeding to removal of system packages..."
-Start-Sleep -Seconds 1
-Clear-Host
-
-$scratchDir = "$($env:SystemDrive)\scratchdir"
-$packagePatterns = @(
-    "Microsoft-Windows-InternetExplorer-Optional-Package~31bf3856ad364e35",
-    "Microsoft-Windows-Kernel-LA57-FoD-Package~31bf3856ad364e35~amd64",
-    "Microsoft-Windows-LanguageFeatures-Handwriting-$languageCode-Package~31bf3856ad364e35",
-    "Microsoft-Windows-LanguageFeatures-OCR-$languageCode-Package~31bf3856ad364e35",
-    "Microsoft-Windows-LanguageFeatures-Speech-$languageCode-Package~31bf3856ad364e35",
-    "Microsoft-Windows-LanguageFeatures-TextToSpeech-$languageCode-Package~31bf3856ad364e35",
-    "Microsoft-Windows-MediaPlayer-Package~31bf3856ad364e35",
-    "Microsoft-Windows-Wallpaper-Content-Extended-FoD-Package~31bf3856ad364e35",
-    "Windows-Defender-Client-Package~31bf3856ad364e35~",
-    "Microsoft-Windows-WordPad-FoD-Package~",
-    "Microsoft-Windows-TabletPCMath-Package~",
-    "Microsoft-Windows-StepsRecorder-Package~"
-
-)
-
-# Get all packages
-$allPackages = & dism /image:$scratchDir /Get-Packages /Format:Table
-$allPackages = $allPackages -split "`n" | Select-Object -Skip 1
-
-foreach ($packagePattern in $packagePatterns) {
-    # Filter the packages to remove
-    $packagesToRemove = $allPackages | Where-Object { $_ -like "$packagePattern*" }
-
-    foreach ($package in $packagesToRemove) {
-        # Extract the package identity
-        $packageIdentity = ($package -split "\s+")[0]
-
-        Write-Host "Removing $packageIdentity..."
-        & dism /image:$scratchDir /Remove-Package /PackageName:$packageIdentity 
+    foreach ($tool in @('dism', 'reg', 'takeown', 'icacls')) {
+        Assert-ExternalTool -Tool $tool
     }
-}
 
-Write-Host "Do you want to enable .NET 3.5? This cannot be done after the image has been created! (y/n)"
-$input = Read-Host
+    $configPath = if ($ConfigurationPath) { $ConfigurationPath } else { Join-Path -Path $PSScriptRoot -ChildPath 'config/Tiny11Builder.config.psd1' }
+    $configuration = Import-Tiny11Configuration -Path $configPath
 
-if ($input -eq 'y') {
-    Write-Host "Enabling .NET 3.5..."
-    & 'dism'  "/image:$scratchDir" '/enable-feature' '/featurename:NetFX3' '/All' "/source:$($env:SystemDrive)\tiny11\sources\sxs" 
-    Write-Host ".NET 3.5 has been enabled."
-}
-elseif ($input -eq 'n') {
-    Write-Host "You chose not to enable .NET 3.5. Continuing..."
-}
-else {
-    Write-Host "Invalid input. Please enter 'y' to enable .NET 3.5 or 'n' to continue without installing .net 3.5."
-}
-Write-Host "Removing Edge:"
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\Edge" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeUpdate" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Program Files (x86)\Microsoft\EdgeCore" -Recurse -Force >null
-if ($architecture -eq 'amd64') {
-    $folderPath = Get-ChildItem -Path "$mainOSDrive\scratchdir\Windows\WinSxS" -Filter "amd64_microsoft-edge-webview_31bf3856ad364e35*" -Directory | Select-Object -ExpandProperty FullName
+    $autounattendLocal = Join-Path -Path $PSScriptRoot -ChildPath 'autounattend.xml'
+    if (-not (Test-Path -Path $autounattendLocal)) {
+        $autounattendUri = 'https://raw.githubusercontent.com/ntdevlabs/tiny11builder/refs/heads/main/autounattend.xml'
+        Invoke-RestMethod -Uri $autounattendUri -OutFile $autounattendLocal
+    }
 
-    if ($folderPath) {
-        & 'takeown' '/f' $folderPath '/r' >null
-        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' >null
-        Remove-Item -Path $folderPath -Recurse -Force >null
+    if (-not (Test-Path -Path $TranscriptDirectory)) {
+        New-Item -ItemType Directory -Path $TranscriptDirectory -Force | Out-Null
+    }
+
+    $transcriptFile = Join-Path -Path $TranscriptDirectory -ChildPath ("tiny11core_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+    Start-Transcript -Path $transcriptFile | Out-Null
+    $transcriptStarted = $true
+
+    $scratchRoot = if ($Scratch) {
+        $scratchDrive = Resolve-DrivePath -DriveLetter $Scratch
+        Join-Path -Path $scratchDrive -ChildPath 'tiny11core'
     } else {
-        Write-Host "Folder not found."
+        Join-Path -Path $env:SystemDrive -ChildPath 'tiny11core'
     }
-} elseif ($architecture -eq 'arm64') {
-    $folderPath = Get-ChildItem -Path "$mainOSDrive\scratchdir\Windows\WinSxS" -Filter "arm64_microsoft-edge-webview_31bf3856ad364e35*" -Directory | Select-Object -ExpandProperty FullName >null
 
-    if ($folderPath) {
-        & 'takeown' '/f' $folderPath '/r'>null
-        & icacls $folderPath  "/grant" "$($adminGroup.Value):(F)" '/T' '/C' >null
-        Remove-Item -Path $folderPath -Recurse -Force >null
+    $workingDirectory = Join-Path -Path $scratchRoot -ChildPath 'tiny11'
+    $mountDirectory = Join-Path -Path $scratchRoot -ChildPath 'scratchdir'
+
+    New-Item -ItemType Directory -Path $workingDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $mountDirectory -Force | Out-Null
+
+    $isoDrive = $null
+    if (-not $ISO) {
+        if ($NoPrompt) {
+            throw 'O parâmetro -ISO é obrigatório quando -NoPrompt é utilizado.'
+        }
+
+        do {
+            $input = Read-Host 'Informe a letra da unidade onde o ISO do Windows 11 está montado (C-Z)'
+        } while (-not $input -or -not (Test-DriveLetter -InputObject $input))
+        $isoDrive = Resolve-DrivePath -DriveLetter $input
     } else {
-        Write-Host "Folder not found."
+        $isoDrive = Resolve-DrivePath -DriveLetter $ISO
     }
-} else {
-    Write-Host "Unknown architecture: $architecture"
-}
-& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/r'
-& 'icacls' "$mainOSDrive\scratchdir\Windows\System32\Microsoft-Edge-Webview" '/grant' "$($adminGroup.Value):(F)" '/T' '/C'
-Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\Microsoft-Edge-Webview" -Recurse -Force
-Write-Host "Removing WinRE"
-& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\Recovery" '/r'
-& 'icacls' "$mainOSDrive\scratchdir\Windows\System32\Recovery" '/grant' 'Administrators:F' '/T' '/C'
-Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\Recovery\winre.wim" -Recurse -Force
-New-Item -Path "$mainOSDrive\scratchdir\Windows\System32\Recovery\winre.wim" -ItemType File -Force
-Write-Host "Removing OneDrive:"
-& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" >null
-& 'icacls' "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" '/grant' "$($adminGroup.Value):(F)" '/T' '/C' >null
-Remove-Item -Path "$mainOSDrive\scratchdir\Windows\System32\OneDriveSetup.exe" -Force >null
-Write-Host "Removal complete!"
-Start-Sleep -Seconds 2
-Clear-Host
-Write-Host "Taking ownership of the WinSxS folder. This might take a while..."
-& 'takeown' '/f' "$mainOSDrive\scratchdir\Windows\WinSxS" '/r'
-& 'icacls' "$mainOSDrive\scratchdir\Windows\WinSxS" '/grant' "$($adminGroup.Value):(F)" '/T' '/C'
-Write-host "Complete!"
-Start-Sleep -Seconds 2
-Clear-Host
-Write-Host "Preparing..."
-$folderPath = Join-Path -Path $mainOSDrive -ChildPath "\scratchdir\Windows\WinSxS_edit"
-$sourceDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS"
-$destinationDirectory = "$mainOSDrive\scratchdir\Windows\WinSxS_edit"
-New-Item -Path $folderPath -ItemType Directory
-if ($architecture -eq "amd64") {
-   $dirsToCopy = @(
-        "x86_microsoft.windows.common-controls_6595b64144ccf1df_*",
-        "x86_microsoft.windows.gdiplus_6595b64144ccf1df_*",    
-        "x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*",
-        "x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*",
-        "x86_microsoft-windows-s..ngstack-onecorebase_31bf3856ad364e35_*",
-        "x86_microsoft-windows-s..stack-termsrv-extra_31bf3856ad364e35_*",
-        "x86_microsoft-windows-servicingstack_31bf3856ad364e35_*",
-        "x86_microsoft-windows-servicingstack-inetsrv_*",
-        "x86_microsoft-windows-servicingstack-onecore_*",
-        "amd64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*",
-        "amd64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*",
-        "amd64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
-        "amd64_microsoft.windows.common-controls_6595b64144ccf1df_*",
-        "amd64_microsoft.windows.gdiplus_6595b64144ccf1df_*",
-        "amd64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*",
-        "amd64_microsoft.windows.isolationautomation_6595b64144ccf1df_*",
-        "amd64_microsoft-windows-s..stack-inetsrv-extra_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-s..stack-msg.resources_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-s..stack-termsrv-extra_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-servicingstack_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*",
-        "amd64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*",
-        "Catalogs",
-        "FileMaps",
-        "Fusion",
-        "InstallTemp",
-        "Manifests",
-        "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*",
-        "x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*",
-        "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*",
-        "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-    )
- # Copy each directory
-   foreach ($dir in $dirsToCopy) {
-        $sourceDirs = Get-ChildItem -Path $sourceDirectory -Filter $dir -Directory
-        foreach ($sourceDir in $sourceDirs) {
-            $destDir = Join-Path -Path $destinationDirectory -ChildPath $sourceDir.Name
-            Write-Host "Copying $sourceDir.FullName to $destDir"
-            Copy-Item -Path $sourceDir.FullName -Destination $destDir -Recurse -Force
-        }
+
+    $isoSources = Join-Path -Path $isoDrive -ChildPath 'sources'
+    $installWimSource = Join-Path -Path $isoSources -ChildPath 'install.wim'
+    $installEsdSource = Join-Path -Path $isoSources -ChildPath 'install.esd'
+    $bootWimSource = Join-Path -Path $isoSources -ChildPath 'boot.wim'
+
+    if (-not (Test-Path -Path $bootWimSource)) {
+        throw "O arquivo boot.wim não foi localizado em '$bootWimSource'."
     }
-}
- elseif ($architecture -eq "arm64") {
-    # Specify the list of files to copy
-     $dirsToCopy = @(
-        "arm64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*",
-        "Catalogs"
-        "FileMaps"
-        "Fusion"
-        "InstallTemp"
-        "Manifests"
-        "SettingsManifests"
-        "Temp"
-        "x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*"
-        "x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*"
-        "x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "x86_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "x86_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "arm_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "arm_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "arm_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "arm_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*"
-        "arm64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*"
-        "arm64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.common-controls_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.gdiplus_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*"
-        "arm64_microsoft.windows.isolationautomation_6595b64144ccf1df_*"
-        "arm64_microsoft-windows-servicing-adm_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingcommon_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicing-onecore-uapi_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingstack_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*"
-        "arm64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*"
-    )
-}
-foreach ($dir in $dirsToCopy) {
-        $sourceDirs = Get-ChildItem -Path $sourceDirectory -Filter $dir -Directory
-        foreach ($sourceDir in $sourceDirs) {
-            $destDir = Join-Path -Path $destinationDirectory -ChildPath $sourceDir.Name
-            Write-Host "Copying $sourceDir.FullName to $destDir"
-            Copy-Item -Path $sourceDir.FullName -Destination $destDir -Recurse -Force
+
+    $tempInstallWim = if (Test-Path -Path $installWimSource) {
+        $installWimSource
+    } elseif (Test-Path -Path $installEsdSource) {
+        if (-not $ImageIndex) {
+            if ($NoPrompt) {
+                throw 'Informe -ImageIndex ao converter install.esd com -NoPrompt.'
+            }
+            Get-WindowsImage -ImagePath $installEsdSource | Format-Table ImageIndex, ImageName
+            do {
+                $inputIndex = Read-Host 'Informe o índice da imagem a ser exportada'
+            } while (-not [int]::TryParse($inputIndex, [ref]$ImageIndex))
         }
-    }  
 
-
-Write-Host "Deleting WinSxS. This may take a while..."
-        Remove-Item -Path $mainOSDrive\scratchdir\Windows\WinSxS -Recurse -Force
-
-Rename-Item -Path $mainOSDrive\scratchdir\Windows\WinSxS_edit -NewName $mainOSDrive\scratchdir\Windows\WinSxS
-Write-Host "Complete!"
-
-Write-Host "Loading registry..."
-reg load HKLM\zCOMPONENTS $ScratchDisk\scratchdir\Windows\System32\config\COMPONENTS | Out-Null
-reg load HKLM\zDEFAULT $ScratchDisk\scratchdir\Windows\System32\config\default | Out-Null
-reg load HKLM\zNTUSER $ScratchDisk\scratchdir\Users\Default\ntuser.dat | Out-Null
-reg load HKLM\zSOFTWARE $ScratchDisk\scratchdir\Windows\System32\config\SOFTWARE | Out-Null
-reg load HKLM\zSYSTEM $ScratchDisk\scratchdir\Windows\System32\config\SYSTEM | Out-Null
-Write-Host "Bypassing system requirements(on the system image):"
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassCPUCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassRAMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassSecureBootCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassStorageCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassTPMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\MoSetup' '/v' 'AllowUpgradesWithUnsupportedTPMOrCPU' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Disabling Sponsored Apps:"
-& 'reg' 'add' 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'OemPreInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'PreInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SilentInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' '/v' 'DisableWindowsConsumerFeatures' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'ContentDeliveryAllowed' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\PolicyManager\current\device\Start' '/v' 'ConfigureStartPins' '/t' 'REG_SZ' '/d' '{"pinnedList": [{}]}' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'ContentDeliveryAllowed' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'ContentDeliveryAllowed' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'FeatureManagementEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'OemPreInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'PreInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'PreInstalledAppsEverEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SilentInstalledAppsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SoftLandingEnabled' '/t' 'REG_DWORD' '/d' '0' '/f'| Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContentEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-310093Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-338388Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-338389Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-338393Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-353694Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContent-353696Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SubscribedContentEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' '/v' 'SystemPaneSuggestionsEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\PushToInstall' '/v' 'DisablePushToInstall' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\MRT' '/v' 'DontOfferThroughWUAU' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'delete' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\Subscriptions' '/f' | Out-Null
-& 'reg' 'delete' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager\SuggestedApps' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' '/v' 'DisableConsumerAccountStateContent' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\CloudContent' '/v' 'DisableCloudOptimizedContent' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Enabling Local Accounts on OOBE:"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' '/v' 'BypassNRO' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Copy-Item -Path "$PSScriptRoot\autounattend.xml" -Destination "$ScratchDisk\scratchdir\Windows\System32\Sysprep\autounattend.xml" -Force | Out-Null
-Write-Host "Disabling Reserved Storage:"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager' '/v' 'ShippedWithReserves' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-Write-Host "Disabling BitLocker Device Encryption"
-& 'reg' 'add' 'HKLM\zSYSTEM\ControlSet001\Control\BitLocker' '/v' 'PreventDeviceEncryption' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Disabling Chat icon:"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Chat' '/v' 'ChatIcon' '/t' 'REG_DWORD' '/d' '3' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced' '/v' 'TaskbarMn' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-Write-Host "Removing Edge related registries"
-reg delete "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge" /f | Out-Null
-reg delete "HKEY_LOCAL_MACHINE\zSOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge Update" /f | Out-Null
-Write-Host "Disabling OneDrive folder backup"
-& 'reg' 'add' "HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive" '/v' 'DisableFileSyncNGSC' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Disabling Telemetry:"
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' '/v' 'Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\Privacy' '/v' 'TailoredExperiencesWithDiagnosticDataEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' '/v' 'HasAccepted' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Input\TIPC' '/v' 'Enabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\InputPersonalization' '/v' 'RestrictImplicitInkCollection' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\InputPersonalization' '/v' 'RestrictImplicitTextCollection' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\InputPersonalization\TrainedDataStore' '/v' 'HarvestContacts' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zNTUSER\Software\Microsoft\Personalization\Settings' '/v' 'AcceptedPrivacyPolicy' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\DataCollection' '/v' 'AllowTelemetry' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSYSTEM\ControlSet001\Services\dmwappushservice' '/v' 'Start' '/t' 'REG_DWORD' '/d' '4' '/f' | Out-Null
-Write-Host "Prevents installation or DevHome and Outlook:"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\OutlookUpdate' '/v' 'workCompleted' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Orchestrator\UScheduler\DevHomeUpdate' '/v' 'workCompleted' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'delete' 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\OutlookUpdate' '/f' | Out-Null
-& 'reg' 'delete' 'HKLM\zSOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe\DevHomeUpdate' '/f' | Out-Null
-Write-Host "Disabling Copilot"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' '/v' 'TurnOffWindowsCopilot' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Edge' '/v' 'HubsSidebarEnabled' '/t' 'REG_DWORD' '/d' '0' '/f' | Out-Null
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Explorer' '/v' 'DisableSearchBoxSuggestions' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Prevents installation of Teams:"
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Teams' '/v' 'DisableInstallation' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-Write-Host "Prevent installation of New Outlook":
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Mail' '/v' 'PreventRun' '/t' 'REG_DWORD' '/d' '1' '/f' | Out-Null
-$tasksPath = "C:\scratchdir\Windows\System32\Tasks"
-
-Write-Host "Deleting scheduled task definition files..."
-
-# Application Compatibility Appraiser
-Remove-Item -Path "$tasksPath\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser" -Force -ErrorAction SilentlyContinue
-
-# Customer Experience Improvement Program (removes the entire folder and all tasks within it)
-Remove-Item -Path "$tasksPath\Microsoft\Windows\Customer Experience Improvement Program" -Recurse -Force -ErrorAction SilentlyContinue
-
-# Program Data Updater
-Remove-Item -Path "$tasksPath\Microsoft\Windows\Application Experience\ProgramDataUpdater" -Force -ErrorAction SilentlyContinue
-
-# Chkdsk Proxy
-Remove-Item -Path "$tasksPath\Microsoft\Windows\Chkdsk\Proxy" -Force -ErrorAction SilentlyContinue
-
-# Windows Error Reporting (QueueReporting)
-Remove-Item -Path "$tasksPath\Microsoft\Windows\Windows Error Reporting\QueueReporting" -Force -ErrorAction SilentlyContinue
-
-Write-Host "Task files have been deleted."
-Write-Host "Disabling Windows Update..."
-& 'reg' 'add' "HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" '/v' 'StopWUPostOOBE1' '/t' 'REG_SZ' '/d' 'net stop wuauserv' '/f'
-& 'reg' 'add' "HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" '/v' 'StopWUPostOOBE2' '/t' 'REG_SZ' '/d' 'sc stop wuauserv' '/f'
-& 'reg' 'add' "HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" '/v' 'StopWUPostOOBE3' '/t' 'REG_SZ' '/d' 'sc config wuauserv start= disabled' '/f'
-& 'reg' 'add' "HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" '/v' 'DisbaleWUPostOOBE1' '/t' 'REG_SZ' '/d' 'reg add HKLM\SYSTEM\CurrentControlSet\Services\wuauserv /v Start /t REG_DWORD /d 4 /f' '/f'
-& 'reg' 'add' "HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" '/v' 'DisbaleWUPostOOBE2' '/t' 'REG_SZ' '/d' 'reg add HKLM\SYSTEM\ControlSet001\Services\wuauserv /v Start /t REG_DWORD /d 4 /f' '/f'
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' '/v' 'DoNotConnectToWindowsUpdateInternetLocations' '/t' 'REG_DWORD' '/d' '1' '/f'
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' '/v' 'DisableWindowsUpdateAccess' '/t' 'REG_DWORD' '/d' '1' '/f' 
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' '/v' 'WUServer' '/t' 'REG_SZ' '/d' 'localhost' '/f' 
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' '/v' 'WUStatusServer' '/t' 'REG_SZ' '/d' 'localhost' '/f' 
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' '/v' 'UpdateServiceUrlAlternate' '/t' 'REG_SZ' '/d' 'localhost' '/f' 
-& 'reg' 'add' 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' '/v' 'UseWUServer' '/t' 'REG_DWORD' '/d' '1' '/f' 
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' '/v' 'DisableOnline' '/t' 'REG_DWORD' '/d' '1' '/f' 
-& 'reg' 'add' 'HKLM\zSYSTEM\ControlSet001\Services\wuauserv' '/v' 'Start' '/t' 'REG_DWORD' '/d' '4' '/f' 
-& 'reg' 'delete' 'HKLM\zSYSTEM\ControlSet001\Services\WaaSMedicSVC' '/f'
-& 'reg' 'delete' 'HKLM\zSYSTEM\ControlSet001\Services\UsoSvc' '/f'
-& 'reg' 'add' 'HKEY_LOCAL_MACHINE\zSOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' '/v' 'NoAutoUpdate' '/t' 'REG_DWORD' '/d' '1' '/f'
-Write-Host "Disabling Windows Defender"
-# Set registry values for Windows Defender services
-$servicePaths = @(
-    "WinDefend",
-    "WdNisSvc",
-    "WdNisDrv",
-    "WdFilter",
-    "Sense"
-)
-
-foreach ($path in $servicePaths) {
-    Set-ItemProperty -Path "HKLM:\zSYSTEM\ControlSet001\Services\$path" -Name "Start" -Value 4
-}
-& 'reg' 'add' 'HKLM\zSOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' '/v' 'SettingsPageVisibility' '/t' 'REG_SZ' '/d' 'hide:virus;windowsupdate' '/f' 
-Write-Host "Tweaking complete!"
-Write-Host "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS >null
-reg unload HKLM\zDEFAULT >null
-reg unload HKLM\zNTUSER >null
-reg unload HKLM\zSOFTWARE
-reg unload HKLM\zSYSTEM >null
-Write-Host "Cleaning up image..."
-& 'dism' '/English' "/image:$mainOSDrive\scratchdir" '/Cleanup-Image' '/StartComponentCleanup' '/ResetBase' >null
-Write-Host "Cleanup complete."
-Write-Host ' '
-Write-Host "Unmounting image..."
-& 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
-Write-Host "Exporting image..."
-& 'dism' '/English' '/Export-Image' "/SourceImageFile:$mainOSDrive\tiny11\sources\install.wim" "/SourceIndex:$index" "/DestinationImageFile:$mainOSDrive\tiny11\sources\install2.wim" '/compress:max'
-Remove-Item -Path "$mainOSDrive\tiny11\sources\install.wim" -Force >null
-Rename-Item -Path "$mainOSDrive\tiny11\sources\install2.wim" -NewName "install.wim" >null
-Write-Host "Windows image completed. Continuing with boot.wim."
-Start-Sleep -Seconds 2
-Clear-Host
-Write-Host "Mounting boot image:"
-$wimFilePath = "$($env:SystemDrive)\tiny11\sources\boot.wim" 
-& takeown "/F" $wimFilePath >null
-& icacls $wimFilePath "/grant" "$($adminGroup.Value):(F)"
-Set-ItemProperty -Path $wimFilePath -Name IsReadOnly -Value $false
-& 'dism' '/English' '/mount-image' "/imagefile:$mainOSDrive\tiny11\sources\boot.wim" '/index:2' "/mountdir:$mainOSDrive\scratchdir"
-Write-Host "Loading registry..."
-reg load HKLM\zCOMPONENTS $mainOSDrive\scratchdir\Windows\System32\config\COMPONENTS
-reg load HKLM\zDEFAULT $mainOSDrive\scratchdir\Windows\System32\config\default
-reg load HKLM\zNTUSER $mainOSDrive\scratchdir\Users\Default\ntuser.dat
-reg load HKLM\zSOFTWARE $mainOSDrive\scratchdir\Windows\System32\config\SOFTWARE
-reg load HKLM\zSYSTEM $mainOSDrive\scratchdir\Windows\System32\config\SYSTEM
-Write-Host "Bypassing system requirements(on the setup image):"
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zDEFAULT\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV1' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zNTUSER\Control Panel\UnsupportedHardwareNotificationCache' '/v' 'SV2' '/t' 'REG_DWORD' '/d' '0' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassCPUCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassRAMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassSecureBootCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassStorageCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\LabConfig' '/v' 'BypassTPMCheck' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKLM\zSYSTEM\Setup\MoSetup' '/v' 'AllowUpgradesWithUnsupportedTPMOrCPU' '/t' 'REG_DWORD' '/d' '1' '/f' >null
-& 'reg' 'add' 'HKEY_LOCAL_MACHINE\zSYSTEM\Setup' '/v' 'CmdLine' '/t' 'REG_SZ' '/d' 'X:\sources\setup.exe' '/f' >null
-Write-Host "Tweaking complete!"
-Write-Host "Unmounting Registry..."
-reg unload HKLM\zCOMPONENTS >null
-reg unload HKLM\zDEFAULT >null
-reg unload HKLM\zNTUSER >null
-reg unload HKLM\zSOFTWARE >null
-reg unload HKLM\zSYSTEM >null
-Write-Host "Unmounting image..."
-& 'dism' '/English' '/unmount-image' "/mountdir:$mainOSDrive\scratchdir" '/commit'
-Clear-Host
-Write-Host "Exporting ESD. This may take a while..."
-& dism /Export-Image /SourceImageFile:"$mainOSDrive\tiny11\sources\install.wim" /SourceIndex:1 /DestinationImageFile:"$mainOSDrive\tiny11\sources\install.esd" /Compress:recovery
-Remove-Item "$mainOSDrive\tiny11\sources\install.wim" > $null 2>&1
-Write-Host "The tiny11 image is now completed. Proceeding with the making of the ISO..."
-Write-Host "Creating ISO image..."
-$ADKDepTools = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\$hostarchitecture\Oscdimg"
-$localOSCDIMGPath = "$PSScriptRoot\oscdimg.exe"
-
-if ([System.IO.Directory]::Exists($ADKDepTools)) {
-    Write-Host "Will be using oscdimg.exe from system ADK."
-    $OSCDIMG = "$ADKDepTools\oscdimg.exe"
-} else {
-    Write-Host "ADK folder not found. Will be using bundled oscdimg.exe."
-    
-    
-    $url = "https://msdl.microsoft.com/download/symbols/oscdimg.exe/3D44737265000/oscdimg.exe"
-
-    if (-not (Test-Path -Path $localOSCDIMGPath)) {
-        Write-Host "Downloading oscdimg.exe..."
-        Invoke-WebRequest -Uri $url -OutFile $localOSCDIMGPath
-
-        if (Test-Path $localOSCDIMGPath) {
-            Write-Host "oscdimg.exe downloaded successfully."
-        } else {
-            Write-Error "Failed to download oscdimg.exe."
-            exit 1
-        }
+        $convertedWim = Join-Path -Path $scratchRoot -ChildPath 'install_from_esd.wim'
+        Export-WindowsImage -SourceImagePath $installEsdSource -SourceIndex $ImageIndex -DestinationImagePath $convertedWim -CompressionType Maximum -CheckIntegrity
+        $convertedWim
     } else {
-        Write-Host "oscdimg.exe already exists locally."
+        throw "Nenhum arquivo install.wim ou install.esd foi localizado em '$isoSources'."
     }
 
-    $OSCDIMG = $localOSCDIMGPath
+    Copy-Item -Path (Join-Path -Path $isoDrive -ChildPath '*') -Destination $workingDirectory -Recurse -Force
+
+    if ($tempInstallWim -and ($tempInstallWim -ne $installWimSource) -and (Test-Path -Path $tempInstallWim)) {
+        Remove-Item -Path $tempInstallWim -Force -ErrorAction SilentlyContinue
+    }
+
+    $sourcesDirectory = Join-Path -Path $workingDirectory -ChildPath 'sources'
+    $installWimPath = Join-Path -Path $sourcesDirectory -ChildPath 'install.wim'
+
+    if ($tempInstallWim -ne $installWimPath) {
+        Copy-Item -Path $tempInstallWim -Destination $installWimPath -Force
+    }
+
+    if (Test-Path -Path (Join-Path -Path $sourcesDirectory -ChildPath 'install.esd')) {
+        Set-ItemProperty -Path (Join-Path -Path $sourcesDirectory -ChildPath 'install.esd') -Name IsReadOnly -Value $false -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path -Path $sourcesDirectory -ChildPath 'install.esd') -Force -ErrorAction SilentlyContinue
+    }
+
+    $availableImages = Get-WindowsImage -ImagePath $installWimPath
+    if (-not $ImageIndex) {
+        if ($NoPrompt) {
+            throw 'Informe -ImageIndex quando -NoPrompt estiver ativo.'
+        }
+
+        $availableImages | Format-Table ImageIndex, ImageName, Architecture
+        do {
+            $inputIndex = Read-Host 'Informe o índice da imagem desejada'
+        } while (-not [int]::TryParse($inputIndex, [ref]$ImageIndex))
+    }
+
+    if ($availableImages.ImageIndex -notcontains $ImageIndex) {
+        throw "O índice $ImageIndex não está presente no arquivo install.wim."
+    }
+
+    $adminSID = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $adminGroup = $adminSID.Translate([System.Security.Principal.NTAccount])
+    $adminGroupName = $adminGroup.Value
+
+    Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/F', $installWimPath
+    Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $installWimPath, '/grant', "$adminGroupName:(F)"
+    Set-ItemProperty -Path $installWimPath -Name IsReadOnly -Value $false
+
+    $systemMounted = $false
+    $systemHives = $null
+    $languageCode = $null
+    $architecture = $null
+
+    try {
+        Mount-WindowsImage -ImagePath $installWimPath -Index $ImageIndex -Path $mountDirectory -ErrorAction Stop
+        $systemMounted = $true
+
+        $intlOutput = & dism /English /Get-Intl "/Image:`"$mountDirectory`""
+        foreach ($line in $intlOutput -split "`n") {
+            if ($line -match 'Default system UI language : ([a-zA-Z]{2}-[a-zA-Z]{2})') {
+                $languageCode = $matches[1]
+                break
+            }
+        }
+
+        $imageInfo = & dism /English /Get-WimInfo "/wimFile:`"$installWimPath`"" "/index:$ImageIndex"
+        foreach ($line in $imageInfo -split "`r?`n") {
+            if ($line -like '*Architecture : *') {
+                $architecture = $line -replace 'Architecture : ', ''
+                if ($architecture -eq 'x64') {
+                    $architecture = 'amd64'
+                }
+                break
+            }
+        }
+
+        Remove-ProvisionedAppxPackages -ImageRoot $mountDirectory -Prefixes $configuration.CoreProvisionedAppxPackagePrefixes
+        Remove-SystemPackages -ImageRoot $mountDirectory -Patterns $configuration.SystemPackagePatterns.Core -LanguageCode $languageCode
+
+        $enableNetFx3 = $EnableNetFx3.IsPresent
+        if (-not $EnableNetFx3.IsPresent -and -not $NoPrompt) {
+            $answer = Read-Host 'Deseja habilitar o .NET Framework 3.5? (s/n)'
+            if ($answer -match '^[sSyY]') {
+                $enableNetFx3 = $true
+            }
+        }
+
+        if ($enableNetFx3) {
+            $sxsSource = Join-Path -Path $sourcesDirectory -ChildPath 'sxs'
+            Invoke-ExternalCommand -FilePath 'dism.exe' -ArgumentList "/image:`"$mountDirectory`"", '/enable-feature', '/featurename:NetFX3', '/All', "/source:`"$sxsSource`""
+        }
+
+        $edgePaths = @(
+            'Program Files (x86)\Microsoft\Edge',
+            'Program Files (x86)\Microsoft\EdgeUpdate',
+            'Program Files (x86)\Microsoft\EdgeCore'
+        )
+        foreach ($relative in $edgePaths) {
+            Remove-Item -Path (Join-Path -Path $mountDirectory -ChildPath $relative) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $edgeWebView = Join-Path -Path $mountDirectory -ChildPath 'Windows\System32\Microsoft-Edge-Webview'
+        if (Test-Path -Path $edgeWebView) {
+            Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/f', $edgeWebView, '/r'
+            Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $edgeWebView, '/grant', "$adminGroupName:(F)", '/T', '/C'
+            Remove-Item -Path $edgeWebView -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        if (-not $architecture) {
+            throw 'Não foi possível determinar a arquitetura da imagem.'
+        }
+
+        $edgeWinSxSPattern = switch ($architecture) {
+            'amd64' { 'amd64_microsoft-edge-webview_31bf3856ad364e35*' }
+            'arm64' { 'arm64_microsoft-edge-webview_31bf3856ad364e35*' }
+            default { throw "Arquitetura não suportada: $architecture" }
+        }
+
+        $winSxsRoot = Join-Path -Path $mountDirectory -ChildPath 'Windows\WinSxS'
+        $edgeFolders = Get-ChildItem -Path $winSxsRoot -Filter $edgeWinSxSPattern -Directory -ErrorAction SilentlyContinue
+        foreach ($folder in $edgeFolders) {
+            Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/f', $folder.FullName, '/r'
+            Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $folder.FullName, '/grant', "$adminGroupName:(F)", '/T', '/C'
+            Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $winReFolder = Join-Path -Path $mountDirectory -ChildPath 'Windows\System32\Recovery'
+        $winReFile = Join-Path -Path $winReFolder -ChildPath 'winre.wim'
+        Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/f', $winReFolder, '/r'
+        Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $winReFolder, '/grant', 'Administrators:F', '/T', '/C'
+        Remove-Item -Path $winReFile -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType File -Path $winReFile -Force | Out-Null
+
+        $oneDriveSetup = Join-Path -Path $mountDirectory -ChildPath 'Windows\System32\OneDriveSetup.exe'
+        if (Test-Path -Path $oneDriveSetup) {
+            Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/f', $oneDriveSetup
+            Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $oneDriveSetup, '/grant', "$adminGroupName:(F)", '/T', '/C'
+            Remove-Item -Path $oneDriveSetup -Force -ErrorAction SilentlyContinue
+        }
+
+        Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/f', $winSxsRoot, '/r'
+        Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $winSxsRoot, '/grant', "$adminGroupName:(F)", '/T', '/C'
+
+        $winSxsEdit = Join-Path -Path (Join-Path -Path $mountDirectory -ChildPath 'Windows') -ChildPath 'WinSxS_edit'
+        New-Item -ItemType Directory -Path $winSxsEdit -Force | Out-Null
+
+        $winSxsPatterns = @{
+            amd64 = @(
+                'x86_microsoft.windows.common-controls_6595b64144ccf1df_*',
+                'x86_microsoft.windows.gdiplus_6595b64144ccf1df_*',
+                'x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*',
+                'x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*',
+                'x86_microsoft-windows-s..ngstack-onecorebase_31bf3856ad364e35_*',
+                'x86_microsoft-windows-s..stack-termsrv-extra_31bf3856ad364e35_*',
+                'x86_microsoft-windows-servicingstack_31bf3856ad364e35_*',
+                'x86_microsoft-windows-servicingstack-inetsrv_*',
+                'x86_microsoft-windows-servicingstack-onecore_*',
+                'amd64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*',
+                'amd64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*',
+                'amd64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*',
+                'amd64_microsoft.windows.common-controls_6595b64144ccf1df_*',
+                'amd64_microsoft.windows.gdiplus_6595b64144ccf1df_*',
+                'amd64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*',
+                'amd64_microsoft.windows.isolationautomation_6595b64144ccf1df_*',
+                'amd64_microsoft-windows-s..stack-inetsrv-extra_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-s..stack-msg.resources_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-s..stack-termsrv-extra_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-servicingstack_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*',
+                'amd64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*',
+                'Catalogs',
+                'FileMaps',
+                'Fusion',
+                'InstallTemp',
+                'Manifests',
+                'x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*',
+                'x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*'
+            )
+            arm64 = @(
+                'arm64_microsoft-windows-servicingstack-onecore_31bf3856ad364e35_*',
+                'Catalogs',
+                'FileMaps',
+                'Fusion',
+                'InstallTemp',
+                'Manifests',
+                'SettingsManifests',
+                'Temp',
+                'x86_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*',
+                'x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*',
+                'x86_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*',
+                'x86_microsoft.windows.common-controls_6595b64144ccf1df_*',
+                'x86_microsoft.windows.gdiplus_6595b64144ccf1df_*',
+                'x86_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*',
+                'x86_microsoft.windows.isolationautomation_6595b64144ccf1df_*',
+                'arm_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*',
+                'arm_microsoft.windows.common-controls_6595b64144ccf1df_*',
+                'arm_microsoft.windows.gdiplus_6595b64144ccf1df_*',
+                'arm_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*',
+                'arm_microsoft.windows.isolationautomation_6595b64144ccf1df_*',
+                'arm64_microsoft.vc80.crt_1fc8b3b9a1e18e3b_*',
+                'arm64_microsoft.vc90.crt_1fc8b3b9a1e18e3b_*',
+                'arm64_microsoft.windows.c..-controls.resources_6595b64144ccf1df_*',
+                'arm64_microsoft.windows.common-controls_6595b64144ccf1df_*',
+                'arm64_microsoft.windows.gdiplus_6595b64144ccf1df_*',
+                'arm64_microsoft.windows.i..utomation.proxystub_6595b64144ccf1df_*',
+                'arm64_microsoft.windows.isolationautomation_6595b64144ccf1df_*',
+                'arm64_microsoft-windows-servicing-adm_31bf3856ad364e35_*',
+                'arm64_microsoft-windows-servicingcommon_31bf3856ad364e35_*',
+                'arm64_microsoft-windows-servicing-onecore-uapi_31bf3856ad364e35_*',
+                'arm64_microsoft-windows-servicingstack_31bf3856ad364e35_*',
+                'arm64_microsoft-windows-servicingstack-inetsrv_31bf3856ad364e35_*',
+                'arm64_microsoft-windows-servicingstack-msg_31bf3856ad364e35_*'
+            )
+        }
+
+        $patternsToCopy = $winSxsPatterns[$architecture]
+        if (-not $patternsToCopy) {
+            throw "Não há padrões de WinSxS definidos para a arquitetura $architecture."
+        }
+
+        foreach ($pattern in $patternsToCopy) {
+            $matchingDirectories = Get-ChildItem -Path $winSxsRoot -Filter $pattern -Directory -ErrorAction SilentlyContinue
+
+            if (-not $matchingDirectories -and (Test-Path -Path (Join-Path -Path $winSxsRoot -ChildPath $pattern))) {
+                $item = Get-Item -Path (Join-Path -Path $winSxsRoot -ChildPath $pattern) -ErrorAction SilentlyContinue
+                if ($item) {
+                    $matchingDirectories = @($item)
+                }
+            }
+
+            foreach ($dir in $matchingDirectories) {
+                $destination = Join-Path -Path $winSxsEdit -ChildPath $dir.Name
+                Copy-Item -Path $dir.FullName -Destination $destination -Recurse -Force
+            }
+        }
+
+        Remove-Item -Path $winSxsRoot -Recurse -Force
+        Rename-Item -Path $winSxsEdit -NewName 'WinSxS'
+
+        $systemHives = Load-RegistryHives -ImageRoot $mountDirectory
+        try {
+            Invoke-RegistryOperations -SetOperations $configuration.RegistryTweaks.SystemImage.Set -RemoveOperations $configuration.RegistryTweaks.SystemImage.Remove
+            Invoke-RegistryOperations -SetOperations $configuration.WindowsUpdatePolicyValues
+            Set-RunOnceCommands -Commands $configuration.WindowsUpdateRunOnceCommands
+            Disable-WindowsDefenderServices -ServiceNames $configuration.DefenderServices
+            Remove-Services -ServiceRegistryKeys $configuration.ServicesToDelete
+
+            $autounattendDest = Join-Path -Path $mountDirectory -ChildPath 'Windows\System32\Sysprep\autounattend.xml'
+            Copy-Item -Path $autounattendLocal -Destination $autounattendDest -Force
+
+            $tasksPath = Join-Path -Path $mountDirectory -ChildPath 'Windows\System32\Tasks'
+            Remove-ScheduledTasks -TasksRoot $tasksPath -RelativePaths $configuration.ScheduledTasksToRemove
+        } finally {
+            if ($systemHives) {
+                Unload-RegistryHives -Hives $systemHives
+            }
+        }
+
+        $cleanupArgs = @("/Image:`"$mountDirectory`"", '/Cleanup-Image', '/StartComponentCleanup', '/ResetBase')
+        Invoke-ExternalCommand -FilePath 'dism.exe' -ArgumentList $cleanupArgs
+    } finally {
+        if ($systemMounted) {
+            Dismount-WindowsImage -Path $mountDirectory -Save
+        }
+    }
+
+    $installWimTempPath = Join-Path -Path $sourcesDirectory -ChildPath 'install2.wim'
+    $exportArgs = @('/Export-Image', "/SourceImageFile:`"$installWimPath`"", "/SourceIndex:$ImageIndex", "/DestinationImageFile:`"$installWimTempPath`"", '/compress:max')
+    Invoke-ExternalCommand -FilePath 'dism.exe' -ArgumentList $exportArgs
+    Remove-Item -Path $installWimPath -Force
+    Rename-Item -Path $installWimTempPath -NewName 'install.wim'
+    $installWimPath = Join-Path -Path $sourcesDirectory -ChildPath 'install.wim'
+
+    $bootWimPath = Join-Path -Path $sourcesDirectory -ChildPath 'boot.wim'
+    Invoke-ExternalCommand -FilePath 'takeown' -ArgumentList '/F', $bootWimPath
+    Invoke-ExternalCommand -FilePath 'icacls' -ArgumentList $bootWimPath, '/grant', "$adminGroupName:(F)"
+    Set-ItemProperty -Path $bootWimPath -Name IsReadOnly -Value $false
+
+    $bootMounted = $false
+    $setupHives = $null
+    try {
+        Mount-WindowsImage -ImagePath $bootWimPath -Index 2 -Path $mountDirectory -ErrorAction Stop
+        $bootMounted = $true
+        $setupHives = Load-RegistryHives -ImageRoot $mountDirectory
+        try {
+            $setupOperations = @()
+            if ($configuration.RegistryTweaks.SetupImage.Set) {
+                $setupOperations += $configuration.RegistryTweaks.SetupImage.Set
+            }
+            if ($configuration.RegistryTweaks.CoreSetupImage.Set) {
+                $setupOperations += $configuration.RegistryTweaks.CoreSetupImage.Set
+            }
+
+            $setupRemove = @()
+            if ($configuration.RegistryTweaks.SetupImage.Remove) {
+                $setupRemove += $configuration.RegistryTweaks.SetupImage.Remove
+            }
+            if ($configuration.RegistryTweaks.CoreSetupImage.Remove) {
+                $setupRemove += $configuration.RegistryTweaks.CoreSetupImage.Remove
+            }
+
+            Invoke-RegistryOperations -SetOperations $setupOperations -RemoveOperations $setupRemove
+        } finally {
+            if ($setupHives) {
+                Unload-RegistryHives -Hives $setupHives
+            }
+        }
+    } finally {
+        if ($bootMounted) {
+            Dismount-WindowsImage -Path $mountDirectory -Save
+        }
+    }
+
+    $installEsdPath = Join-Path -Path $sourcesDirectory -ChildPath 'install.esd'
+    $exportEsdArgs = @('/Export-Image', "/SourceImageFile:`"$installWimPath`"", '/SourceIndex:1', "/DestinationImageFile:`"$installEsdPath`"", '/Compress:recovery')
+    Invoke-ExternalCommand -FilePath 'dism.exe' -ArgumentList $exportEsdArgs
+    Remove-Item -Path $installWimPath -Force
+
+    Copy-Item -Path $autounattendLocal -Destination (Join-Path -Path $workingDirectory -ChildPath 'autounattend.xml') -Force
+
+    $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
+    $localOscdimg = Join-Path -Path $PSScriptRoot -ChildPath 'oscdimg.exe'
+    $oscdimgPath = Get-OscdimgPath -HostArchitecture $hostArchitecture -LocalPath $localOscdimg -ForceDownload:$ForceOscdimgDownload
+
+    $isoOutput = Join-Path -Path $PSScriptRoot -ChildPath 'tiny11-core.iso'
+    if ($PSCmdlet.ShouldProcess($isoOutput, 'Criar imagem ISO do tiny11 core')) {
+        $bootEtfsPath = Join-Path -Path (Join-Path -Path $workingDirectory -ChildPath 'boot') -ChildPath 'etfsboot.com'
+        $efiPath = Join-Path -Path (Join-Path -Path $workingDirectory -ChildPath 'efi') -ChildPath 'microsoft'
+        $efiBootPath = Join-Path -Path (Join-Path -Path $efiPath -ChildPath 'boot') -ChildPath 'efisys.bin'
+        $bootData = "-bootdata:2#p0,e,b$bootEtfsPath#pEF,e,b$efiBootPath"
+        Invoke-ExternalCommand -FilePath $oscdimgPath -ArgumentList '-m', '-o', '-u2', '-udfver102', $bootData, $workingDirectory, $isoOutput
+    }
+
+    if (-not $SkipCleanup) {
+        Remove-Item -Path $workingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $mountDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    if (-not $SkipEject) {
+        try {
+            $volume = Get-Volume -DriveLetter $isoDrive[0] -ErrorAction Stop
+            $diskImage = $volume | Get-DiskImage -ErrorAction Stop
+            $diskImage | Dismount-DiskImage -ErrorAction Stop
+        } catch {
+            Write-Verbose "Falha ao desmontar a imagem ISO de origem: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not $PreserveResources) {
+        Remove-Item -Path $localOscdimg -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $autounattendLocal -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Verbose 'tiny11 core concluído com sucesso.'
 }
-
-& "$OSCDIMG" '-m' '-o' '-u2' '-udfver102' "-bootdata:2#p0,e,b$ScratchDisk\tiny11\boot\etfsboot.com#pEF,e,b$ScratchDisk\tiny11\efi\microsoft\boot\efisys.bin" "$ScratchDisk\tiny11" "$PSScriptRoot\tiny11.iso"
-
-# Finishing up
-Write-Host "Creation completed! Press any key to exit the script..."
-Read-Host "Press Enter to continue"
-Write-Host "Performing Cleanup..."
-Remove-Item -Path "$mainOSDrive\tiny11" -Recurse -Force >null
-Remove-Item -Path "$mainOSDrive\scratchdir" -Recurse -Force >null
-
-# Stop the transcript
-Stop-Transcript
-
-exit
+catch {
+    Write-Error $_
+    exit 1
 }
-elseif ($input -eq 'n') {
-    Write-Host "You chose not to continue. The script will now exit."
-    exit
-}
-else {
-    Write-Host "Invalid input. Please enter 'y' to continue or 'n' to exit."
+finally {
+    if ($transcriptStarted -and $null -ne (Get-Command -Name 'Stop-Transcript' -ErrorAction SilentlyContinue)) {
+        try {
+            Stop-Transcript | Out-Null
+        } catch {
+            # Ignorar falhas ao finalizar o transcript
+        }
+    }
 }

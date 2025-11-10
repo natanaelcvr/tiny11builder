@@ -22,25 +22,41 @@ This script generates a significantly reduced Windows 11 image. However, **it's 
 - ⚠️ **tiny11coremaker.ps1** : The core script, which removes even more bloat but also removes the ability to service the image. You cannot add languages, updates, or features post-creation. This is recommended for quick testing or development use.
 
 ## Instructions:
-1. Download Windows 11 from the [Microsoft website](https://www.microsoft.com/software-download/windows11) or [Rufus](https://github.com/pbatard/rufus)
+1. Download Windows 11 from the [Microsoft website](https://www.microsoft.com/software-download/windows11) or [Rufus](https://github.com/pbatard/rufus).
 2. Mount the downloaded ISO image using Windows Explorer.
-3. Open **PowerShell 5.1** as Administrator. 
-5. Change the script execution policy :
+3. Open **PowerShell 5.1 or newer** as Administrator.
+4. (Optional) Temporarily relax the execution policy for the current session:
+   ```powershell
+   Set-ExecutionPolicy Bypass -Scope Process
+   ```
+   The scripts can also adjust the policy automatically when `-AcceptEula` is used.
+5. Extract the repository and open the folder in the same elevated PowerShell window.
+
+### tiny11maker.ps1 (recomended)
 ```powershell
-Set-ExecutionPolicy Bypass -Scope Process
+./tiny11maker.ps1 -ISO E -Scratch D -ImageIndex 6 -AcceptEula -AutoElevate -Verbose
 ```
-> Using `-Scope Process` you keep your original policy intact as this change only lasts for the current PowerShell session. 
+- `-ISO`              → drive letter of the mounted Windows 11 ISO (required in non-interactive mode).
+- `-Scratch`          → drive letter to host temporary files; defaults to the script directory.
+- `-ImageIndex`       → index from `Get-WindowsImage`; if omitted, the script prompts for it.
+- `-AcceptEula`       → automatically set ExecutionPolicy to RemoteSigned when required.
+- `-AutoElevate`      → relaunches the script elevated if needed.
+- `-NoPrompt`         → fail fast when required inputs are missing (ideal for CI).
+- `-SkipCleanup`/`-SkipEject`/`-PreserveResources` → control artifact retention.
+- Logs are written to `tiny11_yyyyMMdd_HHmmss.log` in the script folder by default; override with `-TranscriptDirectory`.
 
-6. Start the script :
+### tiny11Coremaker.ps1 (experimental)
 ```powershell
-C:/path/to/your/tiny11/script.ps1 -ISO <letter> -SCRATCH <letter>
-``` 
-> You can see of the script by running the `get-help` command.
+./tiny11Coremaker.ps1 -ISO E -ImageIndex 6 -Force -EnableNetFx3 -AcceptEula -AutoElevate
+```
+- Requires `-Force` unless you want an interactive confirmation; tiny11 core is **not serviceable** afterwards.
+- Supports the same quality-of-life switches as the regular script plus `-EnableNetFx3` to pre-stage .NET 3.5.
+- Produces `tiny11-core.iso` in the script directory when successful.
 
-6. Select the drive letter where the image is mounted (only the letter, no colon (:))
-7. Select the SKU that you want the image to be based.
-8. Sit back and relax :)
-9. When the image is completed, you will see it in the folder where the script was extracted, with the name tiny11.iso
+> Use `Get-Help .\tiny11maker.ps1 -Detailed` (and the equivalent for the core script) to review the full parameter set.
+
+### Customising removals
+All app/package/registry selections live in `config/Tiny11Builder.config.psd1`. Adjust the PSD1 and rerun the scripts to tailor the output image.
 
 ---
 
